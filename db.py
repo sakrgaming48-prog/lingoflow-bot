@@ -55,7 +55,7 @@ async def init_db(db_path: str) -> None:
 
         await db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_term
-            ON cart(user_id, term)
+            ON cart(user_id, LOWER(term))
         """)
 
         await db.execute("""
@@ -67,7 +67,7 @@ async def init_db(db_path: str) -> None:
 
         await db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_exported_user_term
-            ON exported_words(user_id, term COLLATE NOCASE)
+            ON exported_words(user_id, LOWER(term))
         """)
 
         await db.commit()
@@ -152,10 +152,12 @@ async def add_to_cart(
     Returns True if the row was actually inserted, False if it
     was a duplicate that got skipped.
     """
+    term = term.strip().lower()
+
     async with aiosqlite.connect(db_path) as db:
         # Check if the word is already exported (case-insensitive)
         async with db.execute(
-            "SELECT 1 FROM exported_words WHERE user_id = ? AND term = ? COLLATE NOCASE",
+            "SELECT 1 FROM exported_words WHERE user_id = ? AND LOWER(term) = ?",
             (user_id, term),
         ) as cursor:
             if await cursor.fetchone():
@@ -164,9 +166,10 @@ async def add_to_cart(
 
         cursor = await db.execute(
             """
-            INSERT OR IGNORE INTO cart
+            INSERT INTO cart
                 (user_id, term, arabic, definition, example, synonym, source_context)
             VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
             """,
             (user_id, term, arabic, definition, example, synonym, source_context),
         )
@@ -239,9 +242,11 @@ async def remove_from_cart(db_path: str, user_id: int, term: str) -> bool:
     
     Returns True if deleted, False if not found.
     """
+    term = term.strip().lower()
+
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
-            "DELETE FROM cart WHERE user_id = ? AND term = ?",
+            "DELETE FROM cart WHERE user_id = ? AND LOWER(term) = ?",
             (user_id, term),
         )
         await db.commit()
@@ -266,8 +271,9 @@ async def archive_cart_to_vault(db_path: str, user_id: int) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
-            INSERT OR IGNORE INTO exported_words (user_id, term)
-            SELECT user_id, term FROM cart WHERE user_id = ?
+            INSERT INTO exported_words (user_id, term)
+            SELECT user_id, LOWER(term) FROM cart WHERE user_id = ?
+            ON CONFLICT DO NOTHING
             """,
             (user_id,)
         )
