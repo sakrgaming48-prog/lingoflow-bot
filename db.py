@@ -58,6 +58,18 @@ async def init_db(db_path: str) -> None:
             ON cart(user_id, term)
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS exported_words (
+                user_id INTEGER,
+                term TEXT
+            )
+        """)
+
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_exported_user_term
+            ON exported_words(user_id, term COLLATE NOCASE)
+        """)
+
         await db.commit()
 
     logger.info("Database initialized successfully.")
@@ -141,6 +153,15 @@ async def add_to_cart(
     was a duplicate that got skipped.
     """
     async with aiosqlite.connect(db_path) as db:
+        # Check if the word is already exported (case-insensitive)
+        async with db.execute(
+            "SELECT 1 FROM exported_words WHERE user_id = ? AND term = ? COLLATE NOCASE",
+            (user_id, term),
+        ) as cursor:
+            if await cursor.fetchone():
+                logger.info("Cart dup: user=%d term=%s (in vault, skipped)", user_id, term)
+                return False
+
         cursor = await db.execute(
             """
             INSERT OR IGNORE INTO cart
@@ -239,3 +260,16 @@ async def increment_total_exported(db_path: str, user_id: int, count: int) -> No
             (count, user_id),
         )
         await db.commit()
+
+async def archive_cart_to_vault(db_path: str, user_id: int) -> None:
+    """Move all terms from the cart to the permanent exported_words vault."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO exported_words (user_id, term)
+            SELECT user_id, term FROM cart WHERE user_id = ?
+            """,
+            (user_id,)
+        )
+        await db.commit()
+    logger.info("Archived cart to vault for user=%d", user_id)

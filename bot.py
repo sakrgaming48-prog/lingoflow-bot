@@ -46,6 +46,7 @@ from db import (
     upsert_user,
     increment_total_exported,
     remove_from_cart,
+    archive_cart_to_vault,
 )
 
 # ── Environment ──────────────────────────────────────────────
@@ -502,7 +503,7 @@ async def _process_images(
             return
 
         # ── Save to cart ─────────────────────────────────────
-        new_count = 0
+        inserted_words = []
         dup_count = 0
         for word in words:
             inserted = await add_to_cart(
@@ -516,12 +517,12 @@ async def _process_images(
                 source_context=word["source_context"],
             )
             if inserted:
-                new_count += 1
+                inserted_words.append(word)
             else:
                 dup_count += 1
 
         # ── Determine context label ──────────────────────────
-        contexts = {w["source_context"] for w in words}
+        contexts = {w["source_context"] for w in inserted_words} if inserted_words else set()
         if "medical" in contexts and "general" in contexts:
             context_label = "مختلط"
         elif "medical" in contexts:
@@ -531,24 +532,28 @@ async def _process_images(
 
         # ── Build response ───────────────────────────────────
         term_list = "\n".join(
-            f"  {i}. {w['term']}" for i, w in enumerate(words, 1)
+            f"  {i}. {w['term']}" for i, w in enumerate(inserted_words, 1)
         )
 
         parts = []
         if reminder:
             parts.append(reminder)
 
-        parts.append(
-            f"✅ تم استخراج <b>{len(words)}</b> كلمة "
-            f"(سياق: {context_label}) وإضافتها لسلتك."
-        )
+        if inserted_words:
+            parts.append(
+                f"✅ تم إضافة <b>{len(inserted_words)}</b> كلمة جديدة "
+                f"(سياق: {context_label}) لسلتك."
+            )
+        else:
+            parts.append("ℹ️ لم يتم إضافة كلمات جديدة لسلتك.")
 
         if dup_count > 0:
             parts.append(
-                f"ℹ️ {dup_count} كلمة موجودة مسبقاً (تم تخطيها)."
+                f"ℹ️ {dup_count} كلمة تم حفظها مسبقاً في القبو الدائم (تم تخطيها)."
             )
 
-        parts.append(f"\n{term_list}")
+        if term_list:
+            parts.append(f"\n{term_list}")
         parts.append("\nاستمر في العمل الممتاز، دكتور. 💪")
 
         await _send_reply_with_retry(message, "\n".join(parts))
@@ -913,6 +918,7 @@ async def _process_export(
             )
             
         await increment_total_exported(DB_PATH, user_id, len(items))
+        await archive_cart_to_vault(DB_PATH, user_id)
         await clear_cart(DB_PATH, user_id)
         await status_msg.delete()
         
