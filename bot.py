@@ -16,11 +16,13 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 
 import google.generativeai as genai
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -396,11 +398,61 @@ async def _check_reminder(user_id: int) -> str:
 #  Photo Handler — Gemini Vision Pipeline
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+async def _generate_content_with_fallback(prompt_parts: list) -> any:
+    """Wrapper to handle Google API rate limits and server errors with retries and model fallbacks."""
+    fallback_queue = [
+        GEMINI_MODEL.model_name,
+        "models/gemini-3.1-flash-lite",
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash"
+    ]
+    
+    last_exception = None
+    
+    for model_name in fallback_queue:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=_GENERATION_CONFIG,
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize model %s: %s", model_name, e)
+            continue
+            
+        logger.info("Attempting generation with model: %s", model_name)
+        for attempt in range(1, 4):
+            try:
+                response = await model.generate_content_async(prompt_parts)
+                return response
+            except Exception as e:
+                last_exception = e
+                logger.warning(
+                    "Model %s attempt %d failed: %s. Retrying in 2 seconds...", 
+                    model_name, attempt, e
+                )
+                await asyncio.sleep(2.0)
+                
+    logger.error("All models and retries failed. Last exception: %s", last_exception)
+    raise last_exception
+
+
+async def _send_reply_with_retry(message, text: str, max_retries: int = 3) -> None:
+    """Wrapper to safely send a message with a retry loop on Timeout/NetworkError."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await message.reply_text(text, parse_mode="HTML")
+            return
+        except (TimedOut, NetworkError) as e:
+            if attempt < max_retries:
+                logger.warning(f"Telegram reply timed out. Retrying in 3 seconds... ({e})")
+                await asyncio.sleep(3.0)
+            else:
+                logger.error(f"Failed to send reply after {max_retries} attempts: {e}")
 
 async def _process_images(
     user_id: int,
     file_ids: list[str],
-    status_msg,
+    message,
     reminder: str,
     context: ContextTypes.DEFAULT_TYPE,
     caption: str = None,
@@ -434,7 +486,7 @@ async def _process_images(
             )
 
         prompt = [active_prompt] + image_parts
-        response = await GEMINI_MODEL.generate_content_async(prompt)
+        response = await _generate_content_with_fallback(prompt)
 
         raw_text = response.text
         logger.info("Gemini raw response length: %d chars", len(raw_text))
@@ -443,7 +495,7 @@ async def _process_images(
         words = _parse_gemini_json(raw_text)
 
         if not words:
-            await status_msg.edit_text(
+            await _send_reply_with_retry(message,
                 "🔍 لم أتمكن من العثور على كلمات إنجليزية في هذه الصورة/الصور.\n"
                 "حاول إرسال صور تحتوي على نص إنجليزي واضح."
             )
@@ -499,21 +551,18 @@ async def _process_images(
         parts.append(f"\n{term_list}")
         parts.append("\nاستمر في العمل الممتاز، دكتور. 💪")
 
-        await status_msg.edit_text(
-            "\n".join(parts),
-            parse_mode="HTML",
-        )
+        await _send_reply_with_retry(message, "\n".join(parts))
 
     except json.JSONDecodeError:
         logger.exception("Failed to parse Gemini JSON for user %d", user_id)
-        await status_msg.edit_text(
+        await _send_reply_with_retry(message,
             "عذراً، لم أتمكن من قراءة الصورة بوضوح. "
             "يرجى إرسال صورة أوضح. 🔄"
         )
 
     except Exception:
         logger.exception("Gemini pipeline error for user %d", user_id)
-        await status_msg.edit_text(
+        await _send_reply_with_retry(message,
             "عذراً، حدث خطأ أثناء معالجة الصور. "
             "يرجى المحاولة مرة أخرى. 🔄"
         )
@@ -533,13 +582,11 @@ async def _process_media_group_task(
 
     file_ids = group_data["file_ids"]
     user_id = group_data["user_id"]
-    status_msg = group_data["status_msg"]
+    message = group_data["message"]
     reminder = group_data["reminder"]
     caption = group_data.get("caption")
 
-    await status_msg.edit_text(f"⏳ جاري تحليل {len(file_ids)} صور معاً...")
-
-    await _process_images(user_id, file_ids, status_msg, reminder, context, caption)
+    await _process_images(user_id, file_ids, message, reminder, context, caption)
 
 
 async def photo_handler(
@@ -570,11 +617,10 @@ async def photo_handler(
     if media_group_id:
         if media_group_id not in _MEDIA_GROUPS:
             # First photo of the group
-            status_msg = await update.message.reply_text("⏳ جاري استلام الصور...")
             _MEDIA_GROUPS[media_group_id] = {
                 "file_ids": [file_id],
                 "user_id": user_id,
-                "status_msg": status_msg,
+                "message": update.message,
                 "reminder": reminder,
                 "caption": caption,
             }
@@ -589,8 +635,7 @@ async def photo_handler(
         return
 
     # ── Single Image Processing ──────────────────────────────
-    status_msg = await update.message.reply_text("⏳ جاري التحليل...")
-    await _process_images(user_id, [file_id], status_msg, reminder, context, caption)
+    await _process_images(user_id, [file_id], update.message, reminder, context, caption)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -649,12 +694,11 @@ async def handle_text(
     
     file_ids = USER_SESSIONS.get(user_id)
     if file_ids:
-        status_msg = await update.message.reply_text("⏳ جاري إعادة التحليل بناءً على تعليماتك...")
         reminder = await _check_reminder(user_id)
         await update_last_activity(DB_PATH, user_id)
         
         # Pass the text as caption/follow-up instruction
-        await _process_images(user_id, file_ids, status_msg, reminder, context, text)
+        await _process_images(user_id, file_ids, update.message, reminder, context, text)
     else:
         await update.message.reply_text(
             "أرسل صورة أولاً لأتمكن من تحليلها وتطبيق تعليماتك عليها. 📸"
@@ -930,6 +974,9 @@ def main() -> None:
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .connect_timeout(60.0)
+        .read_timeout(60.0)
+        .get_updates_connection_pool_size(10)
         .post_init(post_init)
         .build()
     )
@@ -978,4 +1025,14 @@ def main() -> None:
 
     # ── Start polling ────────────────────────────────────────
     logger.info("LingoFlow bot starting... 🚀")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    while True:
+        try:
+            application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
+            break
+        except (TimedOut, NetworkError) as e:
+            logger.warning("⚠️ Telegram servers unreachable, retrying in 10 seconds...")
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Critical error during polling: {e}")
+            break

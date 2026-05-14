@@ -3,3 +3,4 @@ aiosqlite==0.21.0
 python-dotenv==1.1.0
 google-generativeai==0.8.5
 genanki==0.13.1
+streamlit==1.42.0
