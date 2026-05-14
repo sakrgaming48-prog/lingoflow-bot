@@ -3,17 +3,26 @@ LingoFlow — Streamlit Cloud Entrypoint
 ======================================
 Provides a simple Streamlit web UI to satisfy cloud health checks,
 and concurrently starts the Telegram bot in a background thread.
+Includes robust asyncio event loop initialization for Python 3.12+.
 """
 
+import asyncio
 import threading
 import streamlit as st
 import bot
 
+# ── Ensure Event Loop Exists (Python 3.12+ Compat) ──
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 # ── Streamlit UI ──
-st.set_page_config(page_title="LingoFlow Bot", page_icon="🤖")
-st.title("LingoFlow Bot 🤖")
-st.write("✅ Bot is actively running in the background.")
-st.write("This page keeps the Streamlit Cloud instance alive.")
+st.set_page_config(page_title="LingoFlow Bot", page_icon="🩺")
+st.title("🩺 LingoFlow Bot is Active")
+st.success("✅ The Telegram bot is actively polling in the background.")
+st.info("This Streamlit page ensures the cloud instance stays alive.")
 
 # ── Background Bot Thread ──
 @st.cache_resource
