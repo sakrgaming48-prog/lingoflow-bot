@@ -268,7 +268,7 @@ def _parse_gemini_json(raw_text: str) -> list[dict]:
             logger.warning("Skipping item missing keys %s: %s", missing, item)
             continue
         # Normalize term to stripped lowercase for consistency
-        item["term"] = str(item["term"]).strip()
+        item["term"] = str(item["term"]).strip().lower()
         item["arabic"] = str(item["arabic"]).strip()
         item["definition"] = str(item["definition"]).strip()
         item["example"] = str(item["example"]).strip()
@@ -505,7 +505,14 @@ async def _process_images(
         # ── Save to cart ─────────────────────────────────────
         inserted_words = []
         dup_count = 0
+        seen_terms = set()
         for word in words:
+            # Filter intra-batch duplicates
+            if word["term"] in seen_terms:
+                dup_count += 1
+                continue
+            seen_terms.add(word["term"])
+            
             inserted = await add_to_cart(
                 DB_PATH,
                 user_id,
