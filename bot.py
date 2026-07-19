@@ -176,13 +176,12 @@ def _init_gemini_model() -> str:
         logger.info("✅ Model discovered: %s", discovered)
         return discovered
 
-    logger.warning("Dynamic discovery found no suitable model. Trying fallbacks...")
     for name in _FALLBACK_MODELS:
         try:
-            if name.startswith("models/"):
-                url = f"https://generativelanguage.googleapis.com/v1beta/{name}"
-            else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}"
+            clean_name = name.strip()
+            if not clean_name.startswith("models/"):
+                clean_name = f"models/{clean_name}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/{clean_name}"
             params = {"key": GEMINI_API_KEY}
             r = httpx.get(url, params=params, timeout=10.0)
             r.raise_for_status()
@@ -466,13 +465,12 @@ async def _generate_content_with_fallback(
     last_exception = None
 
     for model_name in fallback_queue:
-        if model_name.startswith("models/"):
-            url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
-        else:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        clean_model = model_name.strip()
+        if not clean_model.startswith("models/"):
+            clean_model = f"models/{clean_model}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{clean_model}:generateContent?key={effective_key}"
 
         headers = {
-            "x-goog-api-key": effective_key,
             "Content-Type": "application/json"
         }
 
