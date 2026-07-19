@@ -4,3 +4,5 @@ python-dotenv==1.1.0
 google-generativeai==0.8.5
 genanki==0.13.1
 streamlit==1.42.0
+httpcore>=1.0.0
+httpx>=0.24.0

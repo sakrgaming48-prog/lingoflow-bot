@@ -1,12 +1,21 @@
 """
 LingoFlow — Telegram Bot Core
 ===============================
+Multi-Deck, Dynamic-API architecture.
+
 Handles all Telegram interaction:
   • /start ConversationHandler (deck name onboarding)
   • Photo handler — Gemini Vision extraction pipeline
-  • /cart — view cart contents
-  • /clear — clear cart with inline keyboard confirmation
-  • /export — placeholder (Phase 4)
+  • /cart — view active-deck cart contents
+  • /clear — clear active-deck cart with inline keyboard confirmation
+  • /remove — remove a specific word from the active-deck cart
+  • /export — export active-deck cart as a named .apkg file
+  • /deck — switch active deck
+  • /decks — list all user decks with word counts
+  • /setkey — save / clear personal Gemini API key
+  • /setmodel — save preferred Gemini model string
+  • /stats — per-deck breakdown of exported words
+  • /help — usage guide
   • Lazy 24-hour reminder system
 """
 
@@ -37,16 +46,22 @@ from anki_utils import generate_apkg
 
 from db import (
     add_to_cart,
+    archive_cart_to_vault,
     clear_cart,
+    get_active_deck,
     get_cart,
     get_cart_count,
+    get_exported_stats,
     get_user,
+    get_user_decks,
+    increment_total_exported,
     init_db,
+    remove_from_cart,
+    set_active_deck,
+    set_user_key,
+    set_user_model,
     update_last_activity,
     upsert_user,
-    increment_total_exported,
-    remove_from_cart,
-    archive_cart_to_vault,
 )
 
 # ── Environment ──────────────────────────────────────────────
@@ -65,7 +80,6 @@ logger = logging.getLogger("lingoflow")
 
 # ── Conversation States ─────────────────────────────────────
 AWAITING_DECK_NAME = 0
-AWAITING_SUBDECK_NAME = 1
 
 # ── Media Group Debounce Cache ──────────────────────────────
 _MEDIA_GROUPS: dict[str, dict] = {}
@@ -73,7 +87,9 @@ _MEDIA_GROUPS: dict[str, dict] = {}
 # ── User Sessions (Conversational Memory) ───────────────────
 USER_SESSIONS: dict[int, list[str]] = {}
 
-# ── Gemini Configuration ────────────────────────────────────
+# ── Gemini Global Configuration ─────────────────────────────
+# Configures the default key at startup; per-user keys are
+# handled at call time inside _get_gemini_model_for_user().
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Generation settings shared across all model instances
@@ -83,7 +99,6 @@ _GENERATION_CONFIG = genai.GenerationConfig(
 )
 
 # Fallback model names, ordered from most-preferred to least.
-# Updated May 2026 — older 1.5 names are 404-prone.
 _FALLBACK_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -92,50 +107,11 @@ _FALLBACK_MODELS = [
     "gemini-1.5-flash",
 ]
 
-# Will be set by _init_gemini_model() during post_init
-GEMINI_MODEL = None
+# Set by _init_gemini_model() during post_init — holds the server-default model name
+DISCOVERED_MODEL_NAME: str | None = None
 
 
-def _discover_flash_model() -> str | None:
-    """Query the live model catalog and pick the best flash model.
-
-    Selection criteria (in priority order):
-      1. Supports 'generateContent'
-      2. Name contains 'flash' (speed-optimized for our vision pipeline)
-      3. Name does NOT contain 'preview', 'experimental', or 'image'
-         (we want a stable, text-output model)
-      4. Highest version number wins (e.g., 3.1 > 2.5 > 1.5)
-
-    Returns the model name string, or None if discovery fails entirely.
-    """
-    try:
-        candidates = []
-        for m in genai.list_models():
-            if "generateContent" not in m.supported_generation_methods:
-                continue
-            name_lower = m.name.lower()
-            # Must be a flash variant
-            if "flash" not in name_lower:
-                continue
-            # Skip preview/experimental/image-generation models
-            if any(tag in name_lower for tag in ("preview", "experimental", "image")):
-                continue
-            # Extract version number for sorting (e.g., "gemini-2.5-flash" → 2.5)
-            version = _extract_version(m.name)
-            candidates.append((version, m.name))
-            logger.info("  Candidate: %-40s (version=%.1f)", m.name, version)
-
-        if not candidates:
-            return None
-
-        # Highest version first
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        winner = candidates[0][1]
-        return winner
-
-    except Exception:
-        logger.exception("Model discovery failed")
-        return None
+# ── Model Discovery Helpers ──────────────────────────────────
 
 
 def _extract_version(model_name: str) -> float:
@@ -153,21 +129,55 @@ def _extract_version(model_name: str) -> float:
     return 0.0
 
 
-def _init_gemini_model() -> genai.GenerativeModel:
-    """Initialize the Gemini model with dynamic discovery + fallback chain.
+def _discover_flash_model() -> str | None:
+    """Query the live model catalog and pick the best flash model.
 
-    Called once during post_init. Logs the selected model name.
+    Selection criteria (in priority order):
+      1. Supports 'generateContent'
+      2. Name contains 'flash' (speed-optimized for our vision pipeline)
+      3. Name does NOT contain 'preview', 'experimental', or 'image'
+      4. Highest version number wins (e.g., 3.1 > 2.5 > 1.5)
+
+    Returns the model name string, or None if discovery fails entirely.
     """
-    # Step 1: Try dynamic discovery
+    try:
+        candidates = []
+        for m in genai.list_models():
+            if "generateContent" not in m.supported_generation_methods:
+                continue
+            name_lower = m.name.lower()
+            if "flash" not in name_lower:
+                continue
+            if any(tag in name_lower for tag in ("preview", "experimental", "image")):
+                continue
+            version = _extract_version(m.name)
+            candidates.append((version, m.name))
+            logger.info("  Candidate: %-40s (version=%.1f)", m.name, version)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        winner = candidates[0][1]
+        return winner
+
+    except Exception:
+        logger.exception("Model discovery failed")
+        return None
+
+
+def _init_gemini_model() -> str:
+    """Discover and return the best available model name.
+
+    Returns a model name string (not a GenerativeModel object),
+    which is stored in DISCOVERED_MODEL_NAME for use as the
+    server-default fallback.
+    """
     discovered = _discover_flash_model()
     if discovered:
         logger.info("✅ Model discovered: %s", discovered)
-        return genai.GenerativeModel(
-            model_name=discovered,
-            generation_config=_GENERATION_CONFIG,
-        )
+        return discovered
 
-    # Step 2: Walk the fallback list
     logger.warning("Dynamic discovery found no suitable model. Trying fallbacks...")
     for name in _FALLBACK_MODELS:
         try:
@@ -175,20 +185,58 @@ def _init_gemini_model() -> genai.GenerativeModel:
                 model_name=name,
                 generation_config=_GENERATION_CONFIG,
             )
-            # Quick probe: calling count_tokens is cheap and confirms the model exists
             model.count_tokens("test")
             logger.info("✅ Fallback model OK: %s", name)
-            return model
+            return name
         except Exception:
             logger.warning("  Fallback %-35s → FAILED", name)
             continue
 
-    # Step 3: Last resort — use the top fallback without probing
     logger.error("All fallbacks failed. Using %s (unverified).", _FALLBACK_MODELS[0])
-    return genai.GenerativeModel(
-        model_name=_FALLBACK_MODELS[0],
+    return _FALLBACK_MODELS[0]
+
+
+def _build_model(api_key: str, model_name: str) -> genai.GenerativeModel:
+    """Build a GenerativeModel using the given key and model name."""
+    # Temporarily configure genai with the given key.
+    # This is a module-level call, so we must restore the server key after.
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=model_name,
         generation_config=_GENERATION_CONFIG,
     )
+    # Restore server-default key so other requests aren't affected
+    genai.configure(api_key=GEMINI_API_KEY)
+    return model
+
+
+async def _get_gemini_model_for_user(user_id: int) -> genai.GenerativeModel:
+    """Return the appropriate GenerativeModel for this user.
+
+    Priority:
+      1. User has both gemini_key AND selected_model → use them.
+      2. User has only gemini_key → use it with the server-discovered model.
+      3. User has only selected_model → use server key with their model.
+      4. Neither → use server key + discovered model.
+    """
+    user = await get_user(DB_PATH, user_id)
+
+    user_key = user.get("gemini_key") if user else None
+    user_model = user.get("selected_model") if user else None
+
+    effective_key = user_key if user_key else GEMINI_API_KEY
+    effective_model = user_model if user_model else (DISCOVERED_MODEL_NAME or _FALLBACK_MODELS[0])
+
+    if user_key:
+        # Build with the personal key (temporarily reconfigures genai, then restores)
+        return _build_model(effective_key, effective_model)
+    else:
+        # Use the already-configured server key
+        return genai.GenerativeModel(
+            model_name=effective_model,
+            generation_config=_GENERATION_CONFIG,
+        )
+
 
 # ── Gemini System Prompt ────────────────────────────────────
 EXTRACTION_PROMPT = """You are a specialized vocabulary extraction engine for an Arabic-speaking medical student.
@@ -248,7 +296,6 @@ def _parse_gemini_json(raw_text: str) -> list[dict]:
     """
     text = raw_text.strip()
 
-    # Strip markdown code fences if present
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence_match:
         text = fence_match.group(1).strip()
@@ -258,7 +305,6 @@ def _parse_gemini_json(raw_text: str) -> list[dict]:
     if not isinstance(parsed, list):
         raise ValueError("Gemini response is not a JSON array")
 
-    # Validate and sanitize each entry
     validated = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -267,7 +313,6 @@ def _parse_gemini_json(raw_text: str) -> list[dict]:
             missing = _REQUIRED_KEYS - item.keys()
             logger.warning("Skipping item missing keys %s: %s", missing, item)
             continue
-        # Normalize term to stripped lowercase for consistency
         item["term"] = str(item["term"]).strip().lower()
         item["arabic"] = str(item["arabic"]).strip()
         item["definition"] = str(item["definition"]).strip()
@@ -276,7 +321,7 @@ def _parse_gemini_json(raw_text: str) -> list[dict]:
         item["source_context"] = str(item["source_context"]).strip().lower()
         if item["source_context"] not in ("general", "medical"):
             item["source_context"] = "general"
-        if item["term"]:  # skip empty terms
+        if item["term"]:
             validated.append(item)
 
     return validated
@@ -295,15 +340,13 @@ async def start_command(
     user = await get_user(DB_PATH, user_id)
 
     if user and user["main_deck"]:
-        # Returning user — show current deck, offer to change
         await update.message.reply_text(
             f"مرحباً مجدداً! 👋\n"
-            f"مجموعتك الحالية: <b>{user['main_deck']}</b>\n\n"
+            f"مجموعتك الرئيسية الحالية: <b>{user['main_deck']}</b>\n\n"
             f"أرسل اسماً جديداً لتغييرها، أو /cancel للإلغاء.",
             parse_mode="HTML",
         )
     else:
-        # New user — welcome and prompt for deck name
         await update.message.reply_text(
             "مرحباً يا دكتور! 👋\n\n"
             "أنا <b>LingoFlow</b>، مساعدك الذكي لتحويل الكلمات "
@@ -323,7 +366,6 @@ async def receive_deck_name(
     user_id = update.effective_user.id
     deck_name = update.message.text.strip()
 
-    # ── Validation ───────────────────────────────────────────
     if not deck_name:
         await update.message.reply_text(
             "⚠️ الاسم لا يمكن أن يكون فارغاً. حاول مرة أخرى:"
@@ -344,11 +386,12 @@ async def receive_deck_name(
         )
         return AWAITING_DECK_NAME
 
-    # ── Save to database ─────────────────────────────────────
     await upsert_user(DB_PATH, user_id, deck_name)
 
     await update.message.reply_text(
-        f"✅ تم حفظ المجموعة: <b>{deck_name}</b>\n\n"
+        f"✅ تم حفظ المجموعة الرئيسية: <b>{deck_name}</b>\n\n"
+        "مجموعتك النشطة الآن هي <b>Default</b>. "
+        "يمكنك تغييرها في أي وقت عبر /deck\n\n"
         "أنت جاهز الآن! أرسل صورة وسأستخرج الكلمات منها. 📸",
         parse_mode="HTML",
     )
@@ -373,7 +416,7 @@ async def _check_reminder(user_id: int) -> str:
     """Check if the user's last activity was >24h ago with a non-empty cart.
 
     Returns the reminder string to prepend, or empty string if no reminder.
-    Called before updating last_activity so the check uses the *previous* timestamp.
+    Called before updating last_activity so the check uses the previous timestamp.
     """
     user = await get_user(DB_PATH, user_id)
     if not user or not user["last_activity"]:
@@ -399,27 +442,40 @@ async def _check_reminder(user_id: int) -> str:
 #  Photo Handler — Gemini Vision Pipeline
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def _generate_content_with_fallback(prompt_parts: list) -> any:
-    """Wrapper to handle Google API rate limits and server errors with retries and model fallbacks."""
-    fallback_queue = [
-        GEMINI_MODEL.model_name,
-        "models/gemini-3.1-flash-lite",
-        "models/gemini-2.5-flash",
-        "models/gemini-2.0-flash"
+
+async def _generate_content_with_fallback(
+    prompt_parts: list, user_id: int
+) -> any:
+    """Attempt generation using the user's configured model, then server fallbacks.
+
+    1. Tries the per-user model (or server default) first.
+    2. On failure, walks the server-side _FALLBACK_MODELS list.
+    3. Each model gets up to 3 attempts with a 2-second backoff.
+    """
+    # Build the primary model for this user
+    primary_model = await _get_gemini_model_for_user(user_id)
+    primary_name = primary_model.model_name
+
+    # Build a deduplicated fallback queue starting from the user's model
+    fallback_queue = [primary_name] + [
+        m for m in _FALLBACK_MODELS if m != primary_name
     ]
-    
+
     last_exception = None
-    
+
     for model_name in fallback_queue:
         try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=_GENERATION_CONFIG,
-            )
+            if model_name == primary_name:
+                model = primary_model
+            else:
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config=_GENERATION_CONFIG,
+                )
         except Exception as e:
             logger.warning("Failed to initialize model %s: %s", model_name, e)
             continue
-            
+
         logger.info("Attempting generation with model: %s", model_name)
         for attempt in range(1, 4):
             try:
@@ -428,27 +484,28 @@ async def _generate_content_with_fallback(prompt_parts: list) -> any:
             except Exception as e:
                 last_exception = e
                 logger.warning(
-                    "Model %s attempt %d failed: %s. Retrying in 2 seconds...", 
+                    "Model %s attempt %d failed: %s. Retrying in 2s...",
                     model_name, attempt, e
                 )
                 await asyncio.sleep(2.0)
-                
-    logger.error("All models and retries failed. Last exception: %s", last_exception)
+
+    logger.error("All models and retries exhausted. Last exception: %s", last_exception)
     raise last_exception
 
 
 async def _send_reply_with_retry(message, text: str, max_retries: int = 3) -> None:
-    """Wrapper to safely send a message with a retry loop on Timeout/NetworkError."""
+    """Safely send a message with a retry loop on Timeout/NetworkError."""
     for attempt in range(1, max_retries + 1):
         try:
             await message.reply_text(text, parse_mode="HTML")
             return
         except (TimedOut, NetworkError) as e:
             if attempt < max_retries:
-                logger.warning(f"Telegram reply timed out. Retrying in 3 seconds... ({e})")
+                logger.warning("Telegram reply timed out. Retrying in 3s... (%s)", e)
                 await asyncio.sleep(3.0)
             else:
-                logger.error(f"Failed to send reply after {max_retries} attempts: {e}")
+                logger.error("Failed to send reply after %d attempts: %s", max_retries, e)
+
 
 async def _process_images(
     user_id: int,
@@ -460,8 +517,10 @@ async def _process_images(
 ) -> None:
     """Core extraction logic for one or more images."""
     try:
-        # Save to conversational memory for follow-ups
         USER_SESSIONS[user_id] = file_ids
+
+        # ── Resolve active deck ───────────────────────────────
+        deck_name = await get_active_deck(DB_PATH, user_id)
 
         # ── Download photos ───────────────────────────────────
         image_parts = []
@@ -475,7 +534,8 @@ async def _process_images(
             })
 
         logger.info(
-            "Processing %d photos for user=%d", len(image_parts), user_id
+            "Processing %d photos for user=%d deck=%s",
+            len(image_parts), user_id, deck_name
         )
 
         # ── Send to Gemini ───────────────────────────────────
@@ -487,7 +547,7 @@ async def _process_images(
             )
 
         prompt = [active_prompt] + image_parts
-        response = await _generate_content_with_fallback(prompt)
+        response = await _generate_content_with_fallback(prompt, user_id)
 
         raw_text = response.text
         logger.info("Gemini raw response length: %d chars", len(raw_text))
@@ -496,9 +556,10 @@ async def _process_images(
         words = _parse_gemini_json(raw_text)
 
         if not words:
-            await _send_reply_with_retry(message,
+            await _send_reply_with_retry(
+                message,
                 "🔍 لم أتمكن من العثور على كلمات إنجليزية في هذه الصورة/الصور.\n"
-                "حاول إرسال صور تحتوي على نص إنجليزي واضح."
+                "حاول إرسال صور تحتوي على نص إنجليزي واضح.",
             )
             return
 
@@ -507,15 +568,15 @@ async def _process_images(
         dup_count = 0
         seen_terms = set()
         for word in words:
-            # Filter intra-batch duplicates
             if word["term"] in seen_terms:
                 dup_count += 1
                 continue
             seen_terms.add(word["term"])
-            
+
             inserted = await add_to_cart(
                 DB_PATH,
                 user_id,
+                deck_name=deck_name,
                 term=word["term"],
                 arabic=word["arabic"],
                 definition=word["definition"],
@@ -546,6 +607,8 @@ async def _process_images(
         if reminder:
             parts.append(reminder)
 
+        parts.append(f"📂 المجموعة النشطة: <b>{deck_name}</b>")
+
         if inserted_words:
             parts.append(
                 f"✅ تم إضافة <b>{len(inserted_words)}</b> كلمة جديدة "
@@ -556,7 +619,7 @@ async def _process_images(
 
         if dup_count > 0:
             parts.append(
-                f"ℹ️ {dup_count} كلمة تم حفظها مسبقاً في القبو الدائم (تم تخطيها)."
+                f"ℹ️ {dup_count} كلمة تم حفظها مسبقاً (تم تخطيها)."
             )
 
         if term_list:
@@ -567,16 +630,18 @@ async def _process_images(
 
     except json.JSONDecodeError:
         logger.exception("Failed to parse Gemini JSON for user %d", user_id)
-        await _send_reply_with_retry(message,
+        await _send_reply_with_retry(
+            message,
             "عذراً، لم أتمكن من قراءة الصورة بوضوح. "
-            "يرجى إرسال صورة أوضح. 🔄"
+            "يرجى إرسال صورة أوضح. 🔄",
         )
 
     except Exception:
         logger.exception("Gemini pipeline error for user %d", user_id)
-        await _send_reply_with_retry(message,
+        await _send_reply_with_retry(
+            message,
             "عذراً، حدث خطأ أثناء معالجة الصور. "
-            "يرجى المحاولة مرة أخرى. 🔄"
+            "يرجى المحاولة مرة أخرى. 🔄",
         )
 
 
@@ -608,7 +673,6 @@ async def photo_handler(
     user_id = update.effective_user.id
     user = await get_user(DB_PATH, user_id)
 
-    # ── Gate: setup required ─────────────────────────────────
     if not user or not user["main_deck"]:
         await update.message.reply_text(
             "⚠️ يجب إعداد مجموعة Anki أولاً.\n"
@@ -616,19 +680,16 @@ async def photo_handler(
         )
         return
 
-    # ── Lazy reminder ────────────────────────────────────────
     reminder = await _check_reminder(user_id)
     await update_last_activity(DB_PATH, user_id)
 
-    photo = update.message.photo[-1]  # highest resolution
+    photo = update.message.photo[-1]
     file_id = photo.file_id
     media_group_id = update.message.media_group_id
     caption = update.message.caption
 
-    # ── Debounce Album Processing ────────────────────────────
     if media_group_id:
         if media_group_id not in _MEDIA_GROUPS:
-            # First photo of the group
             _MEDIA_GROUPS[media_group_id] = {
                 "file_ids": [file_id],
                 "user_id": user_id,
@@ -640,62 +701,87 @@ async def photo_handler(
                 _process_media_group_task(media_group_id, update, context)
             )
         else:
-            # Subsequent photos in the same group
             _MEDIA_GROUPS[media_group_id]["file_ids"].append(file_id)
             if caption and not _MEDIA_GROUPS[media_group_id].get("caption"):
                 _MEDIA_GROUPS[media_group_id]["caption"] = caption
         return
 
-    # ── Single Image Processing ──────────────────────────────
     await _process_images(user_id, [file_id], update.message, reminder, context, caption)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /help & /stats Commands
+#  /help Command
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 async def help_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """/help — Explain how to use the bot and custom captions."""
+    """/help — Explain how to use the bot and all available commands."""
     text = (
         "📖 <b>دليل استخدام LingoFlow</b>\n\n"
         "1️⃣ أرسل صورة أو مجموعة صور (ألبوم) تحتوي على نص إنجليزي.\n"
-        "2️⃣ سيقوم الذكاء الاصطناعي باستخراج الكلمات وترجمتها بدقة حسب السياق (طبي أو عام).\n"
-        "3️⃣ الكلمات تُحفظ في <b>السلة</b> الخاصة بك.\n"
-        "4️⃣ استخدم أوامر إدارة السلة: /cart و /remove و /clear.\n"
-        "5️⃣ أرسل /export لتحويل الكلمات في السلة إلى ملف <code>.apkg</code> جاهز للمراجعة في Anki.\n\n"
-        "💡 <b>ميزة متقدمة (المحادثة المستمرة):</b>\n"
-        "يمكنك كتابة تعليق (Caption) مع الصورة لتوجيه الذكاء الاصطناعي.\n"
-        "كما يمكنك إرسال رسالة نصية <b>بعد</b> استخراج الصور لتعديل النتائج.\n"
-        "<i>مثال:</i> 'استخرج الأفعال فقط' أو 'أضف المزيد من الكلمات من الفقرة الثانية'."
+        "2️⃣ سيقوم الذكاء الاصطناعي باستخراج الكلمات وترجمتها حسب السياق.\n"
+        "3️⃣ الكلمات تُحفظ في السلة الخاصة بمجموعتك النشطة.\n"
+        "4️⃣ استخدم /export لتصديرها كملف <code>.apkg</code>.\n\n"
+        "🗂 <b>إدارة المجموعات:</b>\n"
+        "  /deck [اسم] — تبديل المجموعة النشطة\n"
+        "  /decks — عرض جميع مجموعاتك مع عدد الكلمات\n\n"
+        "🛒 <b>إدارة السلة:</b>\n"
+        "  /cart — عرض كلمات السلة الحالية\n"
+        "  /remove [كلمة] — حذف كلمة معينة\n"
+        "  /clear — مسح السلة بالكامل\n\n"
+        "🤖 <b>إعدادات الذكاء الاصطناعي:</b>\n"
+        "  /setkey [مفتاح] — حفظ مفتاح Gemini الشخصي (فارغ لإلغائه)\n"
+        "  /setmodel [نموذج] — تحديد نموذج Gemini (مثال: gemini-2.5-flash)\n\n"
+        "📊 /stats — تقرير الكلمات المُصدَّرة مقسَّم حسب المجموعة\n\n"
+        "💡 <b>ميزة متقدمة:</b> يمكنك كتابة تعليق مع الصورة لتوجيه الذكاء الاصطناعي، "
+        "أو إرسال رسالة نصية بعد الاستخراج لتعديل النتائج."
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  /stats Command — per-deck breakdown
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 async def stats_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """/stats — Show historical export count."""
+    """/stats — Show exported word breakdown by deck + totals."""
     user_id = update.effective_user.id
     user = await get_user(DB_PATH, user_id)
+
     if not user:
         await update.message.reply_text("لم يتم العثور على بيانات. أرسل /start أولاً.")
         return
-        
-    total = user.get("total_exported", 0)
-    await update.message.reply_text(
-        f"📊 <b>إحصائياتك:</b>\n\n"
-        f"مجموع الكلمات التي قمت بتصديرها تاريخياً: <b>{total}</b> كلمة. 🌟\n"
-        f"استمر في الإنجاز!",
-        parse_mode="HTML"
-    )
+
+    total_exported = user.get("total_exported", 0)
+    deck_stats = await get_exported_stats(DB_PATH, user_id)
+    active_deck = await get_active_deck(DB_PATH, user_id)
+    cart_count = await get_cart_count(DB_PATH, user_id, deck_name=active_deck)
+
+    lines = [f"📊 <b>إحصائياتك:</b>\n"]
+
+    if deck_stats:
+        lines.append("📚 <b>الكلمات المُصدَّرة حسب المجموعة:</b>")
+        for entry in deck_stats:
+            lines.append(f"  • {entry['deck_name']}: <b>{entry['count']}</b> كلمة")
+        lines.append(f"\n🌟 <b>المجموع الكلي:</b> {total_exported} كلمة")
+    else:
+        lines.append("لم تقم بتصدير أي كلمات بعد.")
+
+    lines.append(f"\n🛒 في سلة «{active_deck}» الآن: <b>{cart_count}</b> كلمة")
+    lines.append("\nاستمر في الإنجاز! 💪")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Text Handler (Conversational Memory)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 async def handle_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -703,13 +789,11 @@ async def handle_text(
     """Handle follow-up instructions for the last uploaded image(s)."""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
+
     file_ids = USER_SESSIONS.get(user_id)
     if file_ids:
         reminder = await _check_reminder(user_id)
         await update_last_activity(DB_PATH, user_id)
-        
-        # Pass the text as caption/follow-up instruction
         await _process_images(user_id, file_ids, update.message, reminder, context, text)
     else:
         await update.message.reply_text(
@@ -718,41 +802,37 @@ async def handle_text(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /export — Generation & ConversationHandlernts
+#  /cart — View cart contents
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 async def cart_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """/cart — Display a numbered list of terms in the user's cart.
-
-    Shows term names only (no definitions) to keep the view compact.
-    Prepends the lazy 24-hour reminder if applicable.
-    """
+    """/cart — Display a numbered list of terms in the active-deck cart."""
     user_id = update.effective_user.id
 
-    # ── Lazy reminder (check BEFORE updating timestamp) ──────
     reminder = await _check_reminder(user_id)
     await update_last_activity(DB_PATH, user_id)
 
-    # ── Fetch cart ────────────────────────────────────────────
-    items = await get_cart(DB_PATH, user_id)
+    deck_name = await get_active_deck(DB_PATH, user_id)
+    items = await get_cart(DB_PATH, user_id, deck_name)
 
     if not items:
         await update.message.reply_text(
-            "سلتك فارغة. أرسل صورة أولاً. 📸"
+            f"سلة «<b>{deck_name}</b>» فارغة. أرسل صورة أولاً. 📸",
+            parse_mode="HTML",
         )
         return
 
-    # ── Build numbered list ──────────────────────────────────
     term_list = "\n".join(
         f"  {i}. {item['term']}" for i, item in enumerate(items, 1)
     )
 
     text = (
         f"{reminder}"
-        f"🛒 سلتك تحتوي على <b>{len(items)}</b> كلمة:\n\n"
+        f"📂 المجموعة النشطة: <b>{deck_name}</b>\n"
+        f"🛒 السلة تحتوي على <b>{len(items)}</b> كلمة:\n\n"
         f"{term_list}\n\n"
         f"📤 أرسل /export لتصدير البطاقات\n"
         f"🗑 أرسل /clear لمسح السلة\n"
@@ -766,32 +846,34 @@ async def cart_command(
 #  /remove — Delete a specific word
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 async def remove_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """/remove — Delete a specific word from the cart."""
+    """/remove — Delete a specific word from the active-deck cart."""
     user_id = update.effective_user.id
-    
+
     if not context.args:
         await update.message.reply_text(
             "⚠️ يرجى تحديد الكلمة المراد حذفها.\n"
-            "مثال: <code>/remove scrutinize</code>", 
-            parse_mode="HTML"
+            "مثال: <code>/remove scrutinize</code>",
+            parse_mode="HTML",
         )
         return
-        
+
     term = " ".join(context.args).strip()
-    deleted = await remove_from_cart(DB_PATH, user_id, term)
-    
+    deck_name = await get_active_deck(DB_PATH, user_id)
+    deleted = await remove_from_cart(DB_PATH, user_id, deck_name, term)
+
     if deleted:
         await update.message.reply_text(
-            f"🗑️ تم حذف الكلمة: <b>{term}</b> من سلتك.", 
-            parse_mode="HTML"
+            f"🗑️ تم حذف الكلمة: <b>{term}</b> من سلة «{deck_name}».",
+            parse_mode="HTML",
         )
     else:
         await update.message.reply_text(
-            f"لم يتم العثور على الكلمة: <b>{term}</b> في سلتك.", 
-            parse_mode="HTML"
+            f"لم يتم العثور على الكلمة: <b>{term}</b> في سلة «{deck_name}».",
+            parse_mode="HTML",
         )
 
 
@@ -799,7 +881,6 @@ async def remove_command(
 #  /clear — Clear cart with inline keyboard confirmation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Callback data constants for the inline keyboard
 _CB_CLEAR_CONFIRM = "clear_confirm"
 _CB_CLEAR_CANCEL = "clear_cancel"
 
@@ -807,16 +888,16 @@ _CB_CLEAR_CANCEL = "clear_cancel"
 async def clear_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """/clear — Present inline keyboard to confirm cart deletion.
-
-    Prevents accidental data loss under stress by requiring
-    an explicit button press.
-    """
+    """/clear — Present inline keyboard to confirm active-deck cart deletion."""
     user_id = update.effective_user.id
-    count = await get_cart_count(DB_PATH, user_id)
+    deck_name = await get_active_deck(DB_PATH, user_id)
+    count = await get_cart_count(DB_PATH, user_id, deck_name)
 
     if count == 0:
-        await update.message.reply_text("سلتك فارغة بالفعل. ✨")
+        await update.message.reply_text(
+            f"سلة «<b>{deck_name}</b>» فارغة بالفعل. ✨",
+            parse_mode="HTML",
+        )
         return
 
     keyboard = InlineKeyboardMarkup([
@@ -827,7 +908,7 @@ async def clear_command(
     ])
 
     await update.message.reply_text(
-        f"هل أنت متأكد من مسح <b>{count}</b> كلمة؟",
+        f"هل أنت متأكد من مسح <b>{count}</b> كلمة من سلة «{deck_name}»؟",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -838,14 +919,15 @@ async def clear_callback(
 ) -> None:
     """Handle the inline keyboard response for /clear confirmation."""
     query = update.callback_query
-    await query.answer()  # acknowledge the button press to Telegram
+    await query.answer()
 
     user_id = query.from_user.id
 
     if query.data == _CB_CLEAR_CONFIRM:
-        deleted = await clear_cart(DB_PATH, user_id)
+        deck_name = await get_active_deck(DB_PATH, user_id)
+        deleted = await clear_cart(DB_PATH, user_id, deck_name)
         await query.edit_message_text(
-            f"🗑 تم مسح <b>{deleted}</b> كلمة من سلتك.",
+            f"🗑 تم مسح <b>{deleted}</b> كلمة من سلة «{deck_name}».",
             parse_mode="HTML",
         )
     elif query.data == _CB_CLEAR_CANCEL:
@@ -853,90 +935,278 @@ async def clear_callback(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /export — Generation & ConversationHandler
+#  /deck — Switch active deck
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Allowed characters: letters, digits, spaces, underscores, hyphens
+_DECK_NAME_RE = re.compile(r"^[\w\s\-]{1,30}$", re.UNICODE)
+
+
+def _normalize_deck_name(raw: str) -> str | None:
+    """Normalize and validate a deck name provided by the user.
+
+    Rules:
+      - Strip leading/trailing whitespace
+      - Max 30 characters
+      - Only alphanumeric, spaces, underscores, hyphens (Unicode-safe)
+    Returns the normalized name, or None if invalid.
+    """
+    name = raw.strip()
+    if not name:
+        return None
+    # Collapse internal whitespace
+    name = re.sub(r"\s+", " ", name)
+    if len(name) > 30:
+        name = name[:30]
+    if not _DECK_NAME_RE.match(name):
+        return None
+    return name
+
+
+async def deck_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/deck [name] — Switch the active deck."""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        current = await get_active_deck(DB_PATH, user_id)
+        decks = await get_user_decks(DB_PATH, user_id)
+        deck_list = "\n".join(
+            f"  • {d['deck_name']} ({d['count']} كلمة)" for d in decks
+        ) or "  (لا توجد مجموعات بعد)"
+        await update.message.reply_text(
+            f"📂 مجموعتك النشطة الحالية: <b>{current}</b>\n\n"
+            f"مجموعاتك:\n{deck_list}\n\n"
+            f"لتبديل المجموعة: <code>/deck [اسم المجموعة]</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    raw_name = " ".join(context.args)
+    deck_name = _normalize_deck_name(raw_name)
+
+    if deck_name is None:
+        await update.message.reply_text(
+            "⚠️ اسم المجموعة غير صالح.\n"
+            "يجب أن يحتوي على حروف وأرقام ومسافات وشرطات سفلية فقط، "
+            "بحد أقصى 30 حرفاً.\n"
+            f"مثال: <code>/deck Pathology</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    user = await get_user(DB_PATH, user_id)
+    if not user:
+        await update.message.reply_text("أرسل /start أولاً لإعداد حسابك.")
+        return
+
+    await set_active_deck(DB_PATH, user_id, deck_name)
+
+    # Show how many words are already in this deck (may be 0 for new deck)
+    count = await get_cart_count(DB_PATH, user_id, deck_name)
+    count_note = (
+        f"تحتوي هذه المجموعة حالياً على <b>{count}</b> كلمة في السلة."
+        if count > 0 else
+        "هذه مجموعة جديدة — ستُضاف كلماتك إليها من الآن."
+    )
+
+    await update.message.reply_text(
+        f"✅ تم التبديل إلى المجموعة: <b>{deck_name}</b>\n"
+        f"{count_note}",
+        parse_mode="HTML",
+    )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  /decks — List all user decks
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-async def export_start(
+async def decks_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Entry point for /export."""
+) -> None:
+    """/decks — List all decks with their active cart word counts."""
     user_id = update.effective_user.id
-    count = await get_cart_count(DB_PATH, user_id)
+    active_deck = await get_active_deck(DB_PATH, user_id)
+    decks = await get_user_decks(DB_PATH, user_id)
 
-    if count == 0:
-        await update.message.reply_text("سلتك فارغة. أرسل صورة أولاً. 📸")
-        return ConversationHandler.END
+    if not decks:
+        await update.message.reply_text(
+            "لا توجد مجموعات بعد. أرسل صورة أولاً لإضافة كلمات إلى سلتك. 📸"
+        )
+        return
+
+    lines = ["📚 <b>مجموعاتك:</b>\n"]
+    for d in decks:
+        marker = " ✅" if d["deck_name"] == active_deck else ""
+        lines.append(f"  • <b>{d['deck_name']}</b>: {d['count']} كلمة{marker}")
+
+    lines.append(f"\n✅ = المجموعة النشطة الحالية")
+    lines.append(f"لتبديل المجموعة: <code>/deck [اسم]</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  /setkey — Save or clear personal Gemini API key
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+async def setkey_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/setkey [key] — Save a personal Gemini key. No args → clear it."""
+    user_id = update.effective_user.id
+
+    user = await get_user(DB_PATH, user_id)
+    if not user:
+        await update.message.reply_text("أرسل /start أولاً لإعداد حسابك.")
+        return
+
+    if not context.args:
+        # Clear the key
+        await set_user_key(DB_PATH, user_id, None)
+        await update.message.reply_text(
+            "🔑 تم حذف مفتاحك الشخصي. سيتم استخدام مفتاح الخادم الافتراضي من الآن.",
+        )
+        return
+
+    key = context.args[0].strip()
+
+    if not key.startswith("AI") or len(key) < 20:
+        await update.message.reply_text(
+            "⚠️ مفتاح Gemini غير صالح. يجب أن يبدأ بـ <code>AI</code> ويكون بطول مناسب.\n"
+            "احصل على مفتاحك من: aistudio.google.com",
+            parse_mode="HTML",
+        )
+        return
+
+    await set_user_key(DB_PATH, user_id, key)
+
+    # Delete the command message immediately to protect the key from chat history
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🔑 تم حفظ مفتاح Gemini الشخصي بنجاح.\n"
+             "⚠️ تم حذف رسالتك لحماية المفتاح من سجل المحادثة.",
+    )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  /setmodel — Save preferred Gemini model
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+async def setmodel_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/setmodel [model] — Set the Gemini model to use for generation."""
+    user_id = update.effective_user.id
+
+    user = await get_user(DB_PATH, user_id)
+    if not user:
+        await update.message.reply_text("أرسل /start أولاً لإعداد حسابك.")
+        return
+
+    if not context.args:
+        current_model = user.get("selected_model") or DISCOVERED_MODEL_NAME or _FALLBACK_MODELS[0]
+        await update.message.reply_text(
+            f"🤖 نموذجك الحالي: <code>{current_model}</code>\n\n"
+            f"لتغيير النموذج:\n<code>/setmodel gemini-2.5-flash</code>\n"
+            f"أو:\n<code>/setmodel gemini-2.5-pro</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    model_name = context.args[0].strip()
+
+    # Normalize: if user omits the "models/" prefix, that's fine — genai handles it
+    if not model_name:
+        await update.message.reply_text("⚠️ يرجى تحديد اسم النموذج.")
+        return
+
+    await set_user_model(DB_PATH, user_id, model_name)
 
     await update.message.reply_text(
-        "ما اسم المجموعة الفرعية؟\n"
-        "(أو أرسل /skip لتسمية تلقائية بتاريخ اليوم)"
+        f"🤖 تم حفظ النموذج: <code>{model_name}</code>\n"
+        "سيُستخدم هذا النموذج في جميع طلباتك القادمة.",
+        parse_mode="HTML",
     )
-    return AWAITING_SUBDECK_NAME
 
 
-async def skip_subdeck(
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  /export — Generate Anki package for active deck
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+async def export_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle /skip for sub-deck name."""
-    sub_deck = datetime.now().strftime("Daily_%d_%b")
-    return await _process_export(update, context, sub_deck)
+) -> None:
+    """/export — Export the active deck's cart as a named .apkg file.
 
-
-async def receive_subdeck(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle custom sub-deck name."""
-    sub_deck = update.message.text.strip()
-    
-    if len(sub_deck) > 50 or "::" in sub_deck:
-        await update.message.reply_text(
-            "⚠️ اسم غير صالح. يرجى تجنب استخدام :: وألا يزيد عن 50 حرفاً.\n"
-            "حاول مرة أخرى:"
-        )
-        return AWAITING_SUBDECK_NAME
-
-    return await _process_export(update, context, sub_deck)
-
-
-async def _process_export(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_deck: str
-) -> int:
-    """Generate the Anki package and send it to the user."""
+    Deck hierarchy: MainDeck::ActiveDeck
+    File name: LingoFlow_[ActiveDeck]_[Date].apkg
+    """
     user_id = update.effective_user.id
     user = await get_user(DB_PATH, user_id)
+
+    if not user or not user["main_deck"]:
+        await update.message.reply_text(
+            "⚠️ يجب إعداد مجموعة Anki أولاً.\nأرسل /start للبدء."
+        )
+        return
+
+    deck_name = await get_active_deck(DB_PATH, user_id)
+    items = await get_cart(DB_PATH, user_id, deck_name)
+
+    if not items:
+        await update.message.reply_text(
+            f"سلة «<b>{deck_name}</b>» فارغة. أرسل صورة أولاً. 📸",
+            parse_mode="HTML",
+        )
+        return
+
     main_deck = user["main_deck"]
-    
-    items = await get_cart(DB_PATH, user_id)
-    
-    os.makedirs("exports", exist_ok=True)
-    filename = f"LingoFlow_{main_deck}_{sub_deck}.apkg".replace(" ", "_")
+    date_str = datetime.now().strftime("%d%b")  # e.g. "19Jul"
+
+    # Safe filename: replace spaces with underscores, strip special chars
+    safe_deck = re.sub(r"[^\w\-]", "_", deck_name)
+    filename = f"LingoFlow_{safe_deck}_{date_str}.apkg"
     output_path = os.path.join("exports", filename)
-    
+
+    os.makedirs("exports", exist_ok=True)
     status_msg = await update.message.reply_text("⏳ جاري تجهيز الملف...")
-    
+
     try:
-        generate_apkg(user_id, main_deck, sub_deck, items, output_path)
-        
+        generate_apkg(user_id, main_deck, deck_name, items, output_path)
+
         with open(output_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
-                caption="✅ تم تصدير الملف بنجاح. بالتوفيق في مذاكرتك يا دكتور!"
+                filename=filename,
+                caption=(
+                    f"✅ تم تصدير <b>{len(items)}</b> بطاقة من مجموعة «{deck_name}»!\n"
+                    f"المجموعة في Anki: <code>{main_deck}::{deck_name}</code>\n"
+                    "بالتوفيق في مذاكرتك يا دكتور! 🎓"
+                ),
             )
-            
+
         await increment_total_exported(DB_PATH, user_id, len(items))
-        await archive_cart_to_vault(DB_PATH, user_id)
-        await clear_cart(DB_PATH, user_id)
+        await archive_cart_to_vault(DB_PATH, user_id, deck_name)
+        await clear_cart(DB_PATH, user_id, deck_name)
         await status_msg.delete()
-        
+
     except Exception:
-        logger.exception("Export failed for user %d", user_id)
-        await status_msg.edit_text("❌ حدث خطأ أثناء التصدير.")
+        logger.exception("Export failed for user=%d deck=%s", user_id, deck_name)
+        await status_msg.edit_text("❌ حدث خطأ أثناء التصدير. يرجى المحاولة مرة أخرى.")
     finally:
         if os.path.exists(output_path):
             os.remove(output_path)
-
-    return ConversationHandler.END
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -949,23 +1219,28 @@ async def post_init(application) -> None:
 
     Initializes the database schema and discovers the best Gemini model.
     """
-    global GEMINI_MODEL
+    global DISCOVERED_MODEL_NAME
 
     logger.info("Running post_init: initializing database...")
     await init_db(DB_PATH)
 
     logger.info("Running post_init: discovering Gemini model...")
-    GEMINI_MODEL = _init_gemini_model()
-    
+    DISCOVERED_MODEL_NAME = _init_gemini_model()
+    logger.info("Server-default model: %s", DISCOVERED_MODEL_NAME)
+
     logger.info("Running post_init: setting bot commands...")
     commands = [
-        BotCommand("start", "إعداد مجموعة Anki الرئيسية"),
-        BotCommand("cart", "عرض محتويات السلة الحالية"),
-        BotCommand("remove", "حذف كلمة معينة من السلة"),
-        BotCommand("clear", "مسح جميع الكلمات من السلة"),
-        BotCommand("export", "تصدير السلة إلى ملف Anki"),
-        BotCommand("stats", "عرض إحصائياتك التاريخية"),
-        BotCommand("help", "دليل الاستخدام والتعليمات المخصصة"),
+        BotCommand("start",    "إعداد مجموعة Anki الرئيسية"),
+        BotCommand("deck",     "تبديل المجموعة النشطة"),
+        BotCommand("decks",    "عرض جميع مجموعاتك"),
+        BotCommand("cart",     "عرض محتويات السلة الحالية"),
+        BotCommand("remove",   "حذف كلمة معينة من السلة"),
+        BotCommand("clear",    "مسح جميع الكلمات من السلة"),
+        BotCommand("export",   "تصدير السلة إلى ملف Anki"),
+        BotCommand("stats",    "تقرير الكلمات المُصدَّرة حسب المجموعة"),
+        BotCommand("setkey",   "حفظ مفتاح Gemini الشخصي"),
+        BotCommand("setmodel", "تحديد نموذج Gemini المفضل"),
+        BotCommand("help",     "دليل الاستخدام والتعليمات"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -1007,45 +1282,45 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
 
-    # ── /export ConversationHandler ──────────────────────────
-    export_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("export", export_start)],
-        states={
-            AWAITING_SUBDECK_NAME: [
-                CommandHandler("skip", skip_subdeck),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_subdeck)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-    )
-
     # ── Register handlers (order matters!) ───────────────────
     application.add_handler(start_conv_handler)
-    application.add_handler(export_conv_handler)
-    application.add_handler(CommandHandler("cart", cart_command))
-    application.add_handler(CommandHandler("remove", remove_command))
-    application.add_handler(CommandHandler("clear", clear_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
+
+    # Core cart / deck commands
+    application.add_handler(CommandHandler("cart",     cart_command))
+    application.add_handler(CommandHandler("remove",   remove_command))
+    application.add_handler(CommandHandler("clear",    clear_command))
+    application.add_handler(CommandHandler("export",   export_command))
+    application.add_handler(CommandHandler("deck",     deck_command))
+    application.add_handler(CommandHandler("decks",    decks_command))
+
+    # AI configuration commands
+    application.add_handler(CommandHandler("setkey",   setkey_command))
+    application.add_handler(CommandHandler("setmodel", setmodel_command))
+
+    # Info commands
+    application.add_handler(CommandHandler("stats",    stats_command))
+    application.add_handler(CommandHandler("help",     help_command))
+
+    # Media and callback handlers
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     application.add_handler(CallbackQueryHandler(
         clear_callback,
         pattern=f"^({_CB_CLEAR_CONFIRM}|{_CB_CLEAR_CANCEL})$",
     ))
-    
-    # Text Handler MUST be registered after ConversationHandlers
+
+    # Text Handler MUST be last — catches everything not handled above
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # ── Start polling ────────────────────────────────────────
     logger.info("LingoFlow bot starting... 🚀")
-    
+
     while True:
         try:
             application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
             break
-        except (TimedOut, NetworkError) as e:
+        except (TimedOut, NetworkError):
             logger.warning("⚠️ Telegram servers unreachable, retrying in 10 seconds...")
             time.sleep(10)
         except Exception as e:
-            logger.error(f"Critical error during polling: {e}")
+            logger.error("Critical error during polling: %s", e)
             break
