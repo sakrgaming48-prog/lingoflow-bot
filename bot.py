@@ -20,6 +20,7 @@ Handles all Telegram interaction:
 """
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -28,7 +29,7 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 
-import google.generativeai as genai
+import httpx
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, TimedOut
@@ -87,17 +88,6 @@ _MEDIA_GROUPS: dict[str, dict] = {}
 # ── User Sessions (Conversational Memory) ───────────────────
 USER_SESSIONS: dict[int, list[str]] = {}
 
-# ── Gemini Global Configuration ─────────────────────────────
-# Configures the default key at startup; per-user keys are
-# handled at call time inside _get_gemini_model_for_user().
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Generation settings shared across all model instances
-_GENERATION_CONFIG = genai.GenerationConfig(
-    temperature=0.2,
-    max_output_tokens=4096,
-)
-
 # Fallback model names, ordered from most-preferred to least.
 _FALLBACK_MODELS = [
     "gemini-2.5-flash",
@@ -130,7 +120,7 @@ def _extract_version(model_name: str) -> float:
 
 
 def _discover_flash_model() -> str | None:
-    """Query the live model catalog and pick the best flash model.
+    """Query the live model catalog and pick the best flash model via REST API.
 
     Selection criteria (in priority order):
       1. Supports 'generateContent'
@@ -141,18 +131,26 @@ def _discover_flash_model() -> str | None:
     Returns the model name string, or None if discovery fails entirely.
     """
     try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models"
+        params = {"key": GEMINI_API_KEY}
+        r = httpx.get(url, params=params, timeout=15.0)
+        r.raise_for_status()
+        data = r.json()
+
         candidates = []
-        for m in genai.list_models():
-            if "generateContent" not in m.supported_generation_methods:
+        for m in data.get("models", []):
+            supported_methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" not in supported_methods:
                 continue
-            name_lower = m.name.lower()
+            name = m.get("name", "")
+            name_lower = name.lower()
             if "flash" not in name_lower:
                 continue
             if any(tag in name_lower for tag in ("preview", "experimental", "image")):
                 continue
-            version = _extract_version(m.name)
-            candidates.append((version, m.name))
-            logger.info("  Candidate: %-40s (version=%.1f)", m.name, version)
+            version = _extract_version(name)
+            candidates.append((version, name))
+            logger.info("  Candidate: %-40s (version=%.1f)", name, version)
 
         if not candidates:
             return None
@@ -167,7 +165,7 @@ def _discover_flash_model() -> str | None:
 
 
 def _init_gemini_model() -> str:
-    """Discover and return the best available model name.
+    """Discover and return the best available model name via REST checks.
 
     Returns a model name string (not a GenerativeModel object),
     which is stored in DISCOVERED_MODEL_NAME for use as the
@@ -181,11 +179,13 @@ def _init_gemini_model() -> str:
     logger.warning("Dynamic discovery found no suitable model. Trying fallbacks...")
     for name in _FALLBACK_MODELS:
         try:
-            model = genai.GenerativeModel(
-                model_name=name,
-                generation_config=_GENERATION_CONFIG,
-            )
-            model.count_tokens("test")
+            if name.startswith("models/"):
+                url = f"https://generativelanguage.googleapis.com/v1beta/{name}"
+            else:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}"
+            params = {"key": GEMINI_API_KEY}
+            r = httpx.get(url, params=params, timeout=10.0)
+            r.raise_for_status()
             logger.info("✅ Fallback model OK: %s", name)
             return name
         except Exception:
@@ -196,22 +196,8 @@ def _init_gemini_model() -> str:
     return _FALLBACK_MODELS[0]
 
 
-def _build_model(api_key: str, model_name: str) -> genai.GenerativeModel:
-    """Build a GenerativeModel using the given key and model name."""
-    # Temporarily configure genai with the given key.
-    # This is a module-level call, so we must restore the server key after.
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        generation_config=_GENERATION_CONFIG,
-    )
-    # Restore server-default key so other requests aren't affected
-    genai.configure(api_key=GEMINI_API_KEY)
-    return model
-
-
-async def _get_gemini_model_for_user(user_id: int) -> genai.GenerativeModel:
-    """Return the appropriate GenerativeModel for this user.
+async def _get_gemini_credentials_for_user(user_id: int) -> tuple[str, str]:
+    """Return the (api_key, model_name) to use for this user.
 
     Priority:
       1. User has both gemini_key AND selected_model → use them.
@@ -226,16 +212,7 @@ async def _get_gemini_model_for_user(user_id: int) -> genai.GenerativeModel:
 
     effective_key = user_key if user_key else GEMINI_API_KEY
     effective_model = user_model if user_model else (DISCOVERED_MODEL_NAME or _FALLBACK_MODELS[0])
-
-    if user_key:
-        # Build with the personal key (temporarily reconfigures genai, then restores)
-        return _build_model(effective_key, effective_model)
-    else:
-        # Use the already-configured server key
-        return genai.GenerativeModel(
-            model_name=effective_model,
-            generation_config=_GENERATION_CONFIG,
-        )
+    return effective_key, effective_model
 
 
 # ── Gemini System Prompt ────────────────────────────────────
@@ -443,44 +420,73 @@ async def _check_reminder(user_id: int) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+class GeminiResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
 async def _generate_content_with_fallback(
     prompt_parts: list, user_id: int
-) -> any:
+) -> GeminiResponse:
     """Attempt generation using the user's configured model, then server fallbacks.
-
-    1. Tries the per-user model (or server default) first.
-    2. On failure, walks the server-side _FALLBACK_MODELS list.
-    3. Each model gets up to 3 attempts with a 2-second backoff.
+    Uses direct REST API calls to bypass the google-generativeai SDK bug.
     """
-    # Build the primary model for this user
-    primary_model = await _get_gemini_model_for_user(user_id)
-    primary_name = primary_model.model_name
+    effective_key, user_model = await _get_gemini_credentials_for_user(user_id)
 
     # Build a deduplicated fallback queue starting from the user's model
-    fallback_queue = [primary_name] + [
-        m for m in _FALLBACK_MODELS if m != primary_name
+    fallback_queue = [user_model] + [
+        m for m in _FALLBACK_MODELS if m != user_model
     ]
+
+    # Convert prompt parts to Google API JSON structure
+    parts = []
+    for part in prompt_parts:
+        if isinstance(part, str):
+            parts.append({"text": part})
+        elif isinstance(part, dict) and "data" in part:
+            mime_type = part.get("mime_type", "image/jpeg")
+            raw_bytes = part["data"]
+            b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+            parts.append({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": b64_data
+                }
+            })
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.2,
+            "maxOutputTokens": 4096
+        }
+    }
 
     last_exception = None
 
     for model_name in fallback_queue:
-        try:
-            if model_name == primary_name:
-                model = primary_model
-            else:
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config=_GENERATION_CONFIG,
-                )
-        except Exception as e:
-            logger.warning("Failed to initialize model %s: %s", model_name, e)
-            continue
+        if model_name.startswith("models/"):
+            url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
+        else:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
-        logger.info("Attempting generation with model: %s", model_name)
+        headers = {
+            "x-goog-api-key": effective_key,
+            "Content-Type": "application/json"
+        }
+
+        logger.info("Attempting REST generation with model: %s", model_name)
         for attempt in range(1, 4):
             try:
-                response = await model.generate_content_async(prompt_parts)
-                return response
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Extract response text
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return GeminiResponse(text)
             except Exception as e:
                 last_exception = e
                 logger.warning(
@@ -489,7 +495,7 @@ async def _generate_content_with_fallback(
                 )
                 await asyncio.sleep(2.0)
 
-    logger.error("All models and retries exhausted. Last exception: %s", last_exception)
+    logger.error("All models and retries exhausted via REST. Last exception: %s", last_exception)
     raise last_exception
 
 
