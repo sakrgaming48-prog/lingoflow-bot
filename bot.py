@@ -1074,9 +1074,9 @@ async def setkey_command(
 
     key = context.args[0].strip()
 
-    if not key.startswith("AI") or len(key) < 20:
+    if not (key.startswith("AI") or key.startswith("AQ.")) or len(key) < 20:
         await update.message.reply_text(
-            "⚠️ مفتاح Gemini غير صالح. يجب أن يبدأ بـ <code>AI</code> ويكون بطول مناسب.\n"
+            "⚠️ مفتاح Gemini غير صالح. يجب أن يبدأ بـ <code>AI</code> أو <code>AQ.</code> ويكون بطول مناسب.\n"
             "احصل على مفتاحك من: aistudio.google.com",
             parse_mode="HTML",
         )
