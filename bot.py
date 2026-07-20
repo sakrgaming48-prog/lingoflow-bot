@@ -443,7 +443,7 @@ async def _generate_content_with_fallback(
         if isinstance(part, str):
             parts.append({"text": part})
         elif isinstance(part, dict) and "data" in part:
-            mime_type = part.get("mime_type", "image/jpeg")
+            mime_type = part.get("mimeType", part.get("mime_type", "image/jpeg"))
             raw_bytes = part["data"]
             b64_data = base64.b64encode(raw_bytes).decode("utf-8")
             parts.append({
@@ -479,6 +479,8 @@ async def _generate_content_with_fallback(
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     response = await client.post(url, headers=headers, json=payload)
+                    if response.status_code != 200:
+                        logger.error(f"Google API Error Response: {response.status_code} - {response.text}")
                     response.raise_for_status()
                     data = response.json()
                     
@@ -533,7 +535,7 @@ async def _process_images(
             buf = io.BytesIO()
             await file.download_to_memory(buf)
             image_parts.append({
-                "mime_type": "image/jpeg",
+                "mimeType": "image/jpeg",
                 "data": buf.getvalue(),
             })
 
