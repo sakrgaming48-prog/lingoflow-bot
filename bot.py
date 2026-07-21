@@ -1330,3 +1330,38 @@ def main() -> None:
         except Exception as e:
             logger.error("Critical error during polling: %s", e)
             break
+
+def _parse_gemini_json(text: str) -> list:
+    """
+    Extracts and parses JSON array from Gemini's response, 
+    safely ignoring any preceding or trailing conversational text.
+    """
+    import json
+    import logging
+    logger = logging.getLogger("lingoflow")
+    
+    text = text.strip()
+    
+    # البحث عن أول قوس مربع [ وآخر قوس مربع ] لقنص الجدول فقط
+    start_idx = text.find('[')
+    end_idx = text.rfind(']')
+    
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        json_str = text[start_idx:end_idx+1]
+    else:
+        json_str = text
+        
+    # تنظيف أي علامات برمجية زائدة
+    if "```json" in json_str:
+        json_str = json_str.split("```json")[-1]
+    if "```" in json_str:
+        json_str = json_str.split("```")[0]
+        
+    json_str = json_str.strip()
+    
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON string: {json_str}. Error: {e}")
+        raise e
+    
